@@ -2,6 +2,7 @@
 # coding: utf-8
 #
 # Copyright (c) 2012 Alexandre Fiori
+#                    Arturo Filastò
 #
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files (the
@@ -30,6 +31,7 @@ import struct
 import sys
 import time
 import random
+import itertools
 
 from twisted.internet import defer
 from twisted.internet import reactor
@@ -40,6 +42,10 @@ from twisted.web.client import getPage
 class iphdr(object):
     """
     This represents an IP packet header.
+
+    XXX enable IP_TIMESTAMP in setsockopt
+        to get the timestamp of when the router says it has gotten an ICMP
+        timeout.
 
     @assemble packages the packet
     @disassemble disassembles the packet
@@ -122,14 +128,21 @@ class tcphdr(object):
     def checksum(self, data):
         pass
 
+    def __repr__(self):
+        return "<TCPPacket (sport: %s dport: %s seq: %s) " %\
+               (self.sport, self.dport, self.seq)
+
+    @classmethod
     def disassemble(self, data):
         self._raw = data
         tcp = tcphdr()
-        pkt = struct.unpack("!HHLH", data[:20])
-        tcp.sport, tcp.dport, tcp.seq = pkt[:3]
-        tcp.hlen = (pkt[4] >> 10 ) & 0xff
-        tcp.flags = pkf[4] & 0xff
-        tcp.wsize, tcp.cksum = struct.unpack("!HH", data[20:28])
+        pkt = struct.unpack("!HHL", data[:8])
+        tcp.sport, tcp.dport, tcp.seq = pkt
+        if len(data) > 10:
+            pkt = struct.unpack("!H", data[8:10])
+            tcp.hlen = (pkt[0] >> 10 ) & 0xff
+            tcp.flags = pkt[0] & 0xff
+            tcp.wsize, tcp.cksum = struct.unpack("!HH", data[20:24])
         return tcp
 
 class udphdr(object):
@@ -155,11 +168,17 @@ class udphdr(object):
         cksum = 0
         return cksum
 
+    def __repr__(self):
+        return "<UDPPacket (sport %s, dport %s, length %s, data %s)>" % \
+               (self.sport, self.dport, self.length, self.data)
+
+    @classmethod
     def disassemble(self, data):
-        self._raw = udp
+        self._raw = data
         udp = udphdr()
-        pkt = struct.unpack("!HHHH", data)
-        udp.src_port, udp.dst_port, udp.length, udp.cksum = pkt
+        pkt = struct.unpack("!HHHH", data[:8])
+        udp.sport, udp.dport, udp.length, udp.cksum = pkt
+        udp.data = data[8:]
         return udp
 
 class icmphdr(object):
@@ -298,7 +317,8 @@ class Hop(object):
             ping = None
 
         location = self.location if self.location else None
-        return {'ttl': self.ttl, 'ping': ping, 'ip': ip, 'location': location}
+        return {'ttl': self.ttl, 'ping': ping, 'ip': ip, 'location': location,
+                'proto': self.proto, 'dport': self.dport, 'sport': self.sport}
 
     def __repr__(self):
         if self.found:
@@ -312,31 +332,144 @@ class Hop(object):
             ping = "-"
 
         location = ":: %s" % self.location if self.location else ""
-        return "%02d. %s %s %s" % (self.ttl, ping, ip, location)
+        return "%02d. %s %s %s (%s, sport: %s dport: %s)" % (self.ttl, ping, ip, location, self.proto,
+                self.dport, self.sport)
 
+class TracerouteResult(object):
+    """
+    Used to store the results of a Traceroute.
+    """
+    #common_ports = [0, 21, 22, 80, 443]
+    common_ports = [0, 80]
+    hops = []
+    done = False
+
+    def __init__(self, protocol):
+        self.protocol = protocol
+        self.probes = {}
+
+        if protocol == "icmp":
+            self.current = None
+        else:
+            self.current = {}
+            for src, dst in itertools.product(self.common_ports,
+                                              self.common_ports):
+                if src not in self.probes:
+                    self.probes[src] = {}
+                self.probes[src][dst] = []
+
+                if src not in self.current:
+                    self.current[src] = {}
+                self.current[src][dst] = None
+
+    def get_current_probes(self):
+        if self.protocol == "icmp":
+            return self.current
+
+    def add_to_current_probes(self, probe):
+        if self.protocol == "icmp":
+            self.current = probe
+        else:
+            self.current[probe.sport][probe.dport] = probe
+
+    def is_in_progress(self):
+        if self.protocol == "icmp":
+            progress = self.current
+        else:
+            progress = None
+            for x in self.current:
+                for y in self.current[x]:
+                    if self.current[x][y] != None:
+                        progress = True
+        if progress is None:
+            return False
+        else:
+            return True
+
+    def get(self, src=None, dst=None):
+        if self.protocol == "icmp":
+            return self.probes
+        else:
+            return self.probes[src][dst]
+
+    def append(self, probe, src=None, dst=None):
+        if self.protocol == "icmp":
+            self.probes.append(hop)
+        else:
+            self.probes[src][dst].append(probe)
+
+    def pop(self, src=None, dst=None):
+        if self.protocol == "icmp":
+            hop = self.current
+            self.current = None
+            return hop
+
+        elif (dst != None) and (src != None):
+            hop = self.current[src][dst]
+            self.current[src][dst] = None
+            return hop
+
+        else:
+            raise Exception("Did not specify dst and src ports")
+
+    @classmethod
+    def hops(self, target, ttl):
+        """
+        Generates a set of ooni probes for traceroute based network tampering
+        detection.
+
+        We send in one round a set of packets with same TTL but on all protocols
+        and with all possible source and destination ports.
+        """
+        hops = []
+        for src, dst in itertools.product(self.common_ports, self.common_ports):
+            hops.append(Hop(target, ttl,
+                            "tcp", dst, src))
+            hops.append(Hop(target, ttl,
+                            "udp", dst, src))
+        hops.append(Hop(target, ttl, "icmp", 0, 0))
+        return hops
 
 class TracerouteProtocol(object):
     def __init__(self, target, **settings):
+        self.common_ports = [0, 21, 22, 80, 443]
+
         self.target = target
         self.settings = settings
         self.verbose = settings.get("verbose")
         self.proto = settings.get("proto")
         self.rfd = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-                                socket.IPPROTO_ICMP)
-        if self.proto == "icmp":
-            self.sfd = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                 socket.IPPROTO_ICMP)
+        self.sfd = {}
+
+        # Create the data structures to contain the test results
+        self.traceroute = {}
+        self.traceroute["tcp"] = TracerouteResult("tcp")
+        self.traceroute["udp"] = TracerouteResult("udp")
+        self.traceroute["icmp"] = TracerouteResult("icmp")
+
+        if self.settings.get("ooni"):
+            self.sfd["tcp"] = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                    socket.IPPROTO_TCP)
+            self.sfd["icmp"] = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                    socket.IPPROTO_ICMP)
+            self.sfd["udp"] = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                    socket.IPPROTO_UDP)
+        elif self.proto == "icmp":
+            self.sfd["icmp"] = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                                     socket.IPPROTO_ICMP)
         elif self.proto == "udp":
-            self.sfd = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+            self.sfd["udp"] = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                                     socket.IPPROTO_UDP)
         elif self.proto == "tcp":
-            self.sfd = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+            self.sfd["tcp"] = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                                     socket.IPPROTO_TCP)
 
+        # Let me add IP Headers myself, just give me a socket!
         self.rfd.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        self.sfd.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        for fd in self.sfd:
+            self.sfd[fd].setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
 
-        self.hops = []
         self.out_queue = []
         self.waiting = True
         self.deferred = defer.Deferred()
@@ -344,11 +477,19 @@ class TracerouteProtocol(object):
         reactor.addReader(self)
         reactor.addWriter(self)
 
-        # send 1st probe packet
-        self.out_queue.append(Hop(self.target, 1,
-                                  settings.get("proto"),
-                                  self.settings.get("dport"),
-                                  self.settings.get("sport")))
+        # send 1st probe packet(s)
+        if self.settings.get("ooni"):
+            hops = list(TracerouteResult.hops(self.target, 1))
+        else:
+            hops = [Hop(self.target, 1,
+                        settings.get("proto"),
+                        self.settings.get("dport"),
+                        self.settings.get("sport"))]
+        for hop in hops:
+            # Store the to be completed items inside of a dictionary
+            self.traceroute[hop.proto].add_to_current_probes(hop)
+            self.out_queue.append(hop)
+
 
     def logPrefix(self):
         return "TracerouteProtocol(%s)" % self.target
@@ -357,7 +498,7 @@ class TracerouteProtocol(object):
         return self.rfd.fileno()
 
     @defer.inlineCallbacks
-    def hopFound(self, hop, ip, icmp):
+    def hopFound(self, hop, ip, icmp, ref, subref):
         hop.remote_ip = ip
         hop.remote_icmp = icmp
 
@@ -370,7 +511,9 @@ class TracerouteProtocol(object):
                 hop.remote_host = yield reverse_lookup(ip.src)
 
         ttl = hop.ttl + 1
-        last = self.hops[-2:]
+
+        last = self.traceroute[hop.proto].get(hop.dport, hop.sport)
+
         if (len(last) == 2 and last[0].remote_ip == ip) or \
            (ttl > (self.settings.get("max_hops", 30) + 1)):
             done = True
@@ -387,13 +530,26 @@ class TracerouteProtocol(object):
                 self.deferred.callback(self.hops)
                 self.deferred = None
         else:
-            self.out_queue.append(Hop(self.target, ttl,
-                                      self.settings.get("proto"),
-                                      self.settings.get("dport"),
-                                      self.settings.get("sport")))
+            hops = []
+            if self.settings.get("ooni"):
+                if not (self.traceroute["icmp"].is_in_progress() or
+                        self.traceroute["tcp"].is_in_progress() or
+                        self.traceroute["udp"].is_in_progress()):
+                    # Add hops only if we are not in progress
+                    hops = list(TracerouteResult.hops(self.target, ttl))
+            else:
+                hops = [Hop(self.target, ttl,
+                            settings.get("proto"),
+                            self.settings.get("dport"),
+                            self.settings.get("sport"))]
+
+            for hop in hops:
+                # Store the to be completed items inside of a dictionary
+                self.traceroute[hop.proto].add_to_current_probes(hop)
+                self.out_queue.append(hop)
 
     def doRead(self):
-        if not self.waiting or not self.hops:
+        if not self.waiting:
             return
 
         pkt = self.rfd.recv(4096)
@@ -405,48 +561,91 @@ class TracerouteProtocol(object):
             print "src %s" % ip.src
             pprintp(pkt)
 
+        # Not interested in non ICMP packets.
         if ip.proto != socket.IPPROTO_ICMP:
             return
 
         found = False
+        foundHop = None
 
         # disassemble icmp header
         icmp = icmphdr.disassemble(pkt[20:28])
-        if icmp.type == 0 and icmp.id == self.hops[-1].icmp.id:
+
+        if self.verbose:
+            print icmp
+
+        # If it's an ICMP Echo reply then our ICMP probe has hit destination
+        if icmp.type == 0 and icmp.id == self.current_hop["icmp"][1].icmp.id:
+            foundHop = self.traceroute["icmp"].pop()
             found = True
+
         elif icmp.type == 11:
             # disassemble referenced ip header
             ref = iphdr.disassemble(pkt[28:48])
+            subref = None
+
+            if self.verbose:
+                print ref
+
             if ref.dst == self.target:
                 found = True
+
+            if ref.proto == socket.IPPROTO_UDP:
+                subref = udphdr.disassemble(pkt[48:])
+                proto = "udp"
+
+            elif ref.proto == socket.IPPROTO_TCP:
+                subref = tcphdr.disassemble(pkt[48:])
+                proto = "tcp"
+
+            else:
+                proto = "icmp"
+
+            if subref:
+                sport = subref.sport
+                dport = subref.dport
+            else:
+                sport = None
+                dport = None
+            # Remove completed hops
+            foundHop = self.traceroute[proto].pop(sport,
+                                                  dport)
 
         if ip.src == self.target:
             self.waiting = False
 
         if found:
-            self.hopFound(self.hops[-1], ip, icmp)
+            self.hopFound(foundHop, ip, icmp, ref, subref)
+        elif foundHop:
+            self.hopFound(foundHop, ip, icmp, ref, subref)
 
-    def hopTimeout(self, *ign):
-        hop = self.hops[-1]
+    def hopTimeout(self, hop):
         if not hop.found:
             if hop.tries < self.settings.get("max_tries", 3):
                 # retry
+                hop.tries += 1
                 self.out_queue.append(hop)
             else:
                 # give up and move forward
-                self.hopFound(hop, None, None)
+                self.traceroute[hop.proto].pop(hop.dport,
+                                               hop.sport)
+                self.hopFound(hop, None, None, None, None)
 
     def doWrite(self):
         if self.waiting and self.out_queue:
             hop = self.out_queue.pop(0)
             pkt = hop.pkt
-            if not self.hops or (self.hops and hop.ttl != self.hops[-1].ttl):
-                self.hops.append(hop)
+            if self.verbose:
+                print "Sending this packet:"
+                pprintp(pkt)
+                print hop
 
-            self.sfd.sendto(pkt, (hop.ip.dst, 0))
+            self.sfd[hop.proto].sendto(pkt, (hop.ip.dst, 0))
+
+            self.traceroute[hop.proto].add_to_current_probes(hop)
 
             timeout = self.settings.get("timeout", 1)
-            reactor.callLater(timeout, self.hopTimeout)
+            reactor.callLater(timeout, self.hopTimeout, hop)
 
     def connectionLost(self, why):
         pass
@@ -463,7 +662,6 @@ def start_trace(target, **settings):
     if settings["hop_callback"] is None:
         for hop in hops:
             print hop
-
     reactor.stop()
 
 class Options(usage.Options):
@@ -472,6 +670,7 @@ class Options(usage.Options):
         ["no-dns", "n", "Show numeric IPs only, not their host names."],
         ["no-geoip", "g", "Do not collect and show GeoIP information"],
         ["verbose", "v", "Be more verbose"],
+        ["ooni", "o", "Run the ooni common port multiprotocol traceroute"],
         ["help", "h", "Show this help"],
     ]
     optParameters = [
@@ -495,6 +694,7 @@ def main():
                     dport=None,
                     sport=None,
                     verbose=False,
+                    ooni=False,
                     max_tries=3,
                     max_hops=30)
 
@@ -523,6 +723,8 @@ def main():
         settings["geoip_lookup"] = False
     if config.get("verbose"):
         settings["verbose"] = True
+    if config.get("ooni"):
+        settings["ooni"] = True
     if "timeout" in config:
         settings["timeout"] = config["timeout"]
     if "tries" in config:
