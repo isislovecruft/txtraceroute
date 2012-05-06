@@ -32,6 +32,7 @@ import sys
 import time
 import random
 import itertools
+from pprint import pprint
 
 from twisted.internet import defer
 from twisted.internet import reactor
@@ -96,7 +97,7 @@ class iphdr(object):
                 self.length, self.src, self.dst)
 
 class tcphdr(object):
-    def __init__(self, data="", dport=4242, sport=4242):
+    def __init__(self, data="", sport=4242, dport=4242):
         self.seq = 0
         self.hlen = 44
         self.flags = 2
@@ -146,7 +147,7 @@ class tcphdr(object):
         return tcp
 
 class udphdr(object):
-    def __init__(self, data="", dport=4242, sport=4242):
+    def __init__(self, data="", sport=4242, dport=4242):
         self.dport = dport
         self.sport = sport
         self.cksum = 0
@@ -267,7 +268,7 @@ def reverse_lookup(ip):
 
 
 class Hop(object):
-    def __init__(self, target, ttl, proto, dport=None, sport=None):
+    def __init__(self, target, ttl, proto, sport=None, dport=None):
         self.proto = proto
         self.dport = dport
         self.sport = sport
@@ -289,11 +290,11 @@ class Hop(object):
             self.icmp.id = self.ip.id
             self.ip.data = self.icmp.assemble()
         elif self.proto == "udp":
-            self.udp = udphdr('\x00'*20, self.dport, self.sport)
+            self.udp = udphdr('\x00'*20, self.sport, self.dport)
             self.ip.data = self.udp.assemble()
             self.ip.proto = socket.IPPROTO_UDP
         else:
-            self.tcp = tcphdr('\x42'*20, self.dport, self.sport)
+            self.tcp = tcphdr('\x42'*20, self.sport, self.dport)
             self.ip.data = self.tcp.assemble()
             self.ip.proto = socket.IPPROTO_TCP
 
@@ -332,15 +333,16 @@ class Hop(object):
             ping = "-"
 
         location = ":: %s" % self.location if self.location else ""
-        return "%02d. %s %s %s (%s, sport: %s dport: %s)" % (self.ttl, ping, ip, location, self.proto,
-                self.dport, self.sport)
+        return "%02d. %s %s %s (%s, sport: %s dport: %s)" % (self.ttl, ping, ip, location, self.proto, self.sport, self.dport)
 
 class TracerouteResult(object):
     """
     Used to store the results of a Traceroute.
     """
-    #common_ports = [0, 21, 22, 80, 443]
-    common_ports = [0, 80]
+    #src_ports = [0, 9090]
+    #dst_ports = [0, 21, 123, 80, 443]
+    src_ports = [0, 80]
+    dst_ports = [0, 80]
     hops = []
     done = False
 
@@ -352,8 +354,8 @@ class TracerouteResult(object):
             self.current = None
         else:
             self.current = {}
-            for src, dst in itertools.product(self.common_ports,
-                                              self.common_ports):
+            for src, dst in itertools.product(self.src_ports,
+                                              self.dst_ports):
                 if src not in self.probes:
                     self.probes[src] = {}
                 self.probes[src][dst] = []
@@ -422,17 +424,16 @@ class TracerouteResult(object):
         and with all possible source and destination ports.
         """
         hops = []
-        for src, dst in itertools.product(self.common_ports, self.common_ports):
+        for src, dst in itertools.product(self.src_ports, self.dst_ports):
             hops.append(Hop(target, ttl,
-                            "tcp", dst, src))
+                            "tcp", src, dst))
             hops.append(Hop(target, ttl,
-                            "udp", dst, src))
+                            "udp", src, dst))
         hops.append(Hop(target, ttl, "icmp", 0, 0))
         return hops
 
 class TracerouteProtocol(object):
     def __init__(self, target, **settings):
-        self.common_ports = [0, 21, 22, 80, 443]
 
         self.target = target
         self.settings = settings
@@ -483,13 +484,12 @@ class TracerouteProtocol(object):
         else:
             hops = [Hop(self.target, 1,
                         settings.get("proto"),
-                        self.settings.get("dport"),
-                        self.settings.get("sport"))]
+                        self.settings.get("sport"),
+                        self.settings.get("dport"))]
         for hop in hops:
             # Store the to be completed items inside of a dictionary
             self.traceroute[hop.proto].add_to_current_probes(hop)
             self.out_queue.append(hop)
-
 
     def logPrefix(self):
         return "TracerouteProtocol(%s)" % self.target
@@ -512,10 +512,7 @@ class TracerouteProtocol(object):
 
         ttl = hop.ttl + 1
 
-        last = self.traceroute[hop.proto].get(hop.dport, hop.sport)
-
-        if (len(last) == 2 and last[0].remote_ip == ip) or \
-           (ttl > (self.settings.get("max_hops", 30) + 1)):
+        if (ttl > (self.settings.get("max_hops", 30) + 1)):
             done = True
         else:
             done = False
@@ -540,8 +537,8 @@ class TracerouteProtocol(object):
             else:
                 hops = [Hop(self.target, ttl,
                             settings.get("proto"),
-                            self.settings.get("dport"),
-                            self.settings.get("sport"))]
+                            self.settings.get("sport"),
+                            self.settings.get("dport"))]
 
             for hop in hops:
                 # Store the to be completed items inside of a dictionary
